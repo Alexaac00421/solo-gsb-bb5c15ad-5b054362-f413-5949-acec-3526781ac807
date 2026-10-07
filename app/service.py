@@ -27,6 +27,17 @@
 库中冲突、引用缺失、锚点序列非法或试图变更封存周期时整包拒绝，不留
 部分数据。整个导入在单个写事务内完成，并发导入与发布都不会观察到
 半包状态。
+
+按已发布版本恢复周期（restore，v1.9）：现场误改了尚未封存的周期，可
+凭任一已发布版本把该周期恢复为版本冻结内容。请求携带设备、周期、
+版本号与从周期详情取得的当前内容指纹，在同一写事务内核对当前指纹、
+封存状态、版本内容与采集编号占用；通过后仅重写目标周期的锚点与声段
+（补齐缺失、按冻结内容改本地起止与备注、删除版本中不属于该周期的
+声段），并按恢复后锚点重算定位。历史版本不记录空周期：版本中既无
+该周期锚点也无声段时明确拒绝，绝不按空周期清除；旧版（format_rev=1）
+未标周期的冻结记录按 default 解释。版本不存在、设备/周期不存在、
+指纹过期、周期已封存，或版本声段采集编号现被其他设备/周期占用时整次
+拒绝，不留部分写入；其他周期、采集包重传回执与已发布版本保持原样。
 """
 from __future__ import annotations
 
@@ -1636,3 +1647,206 @@ def get_version(db_path: str, version_no: int):
             # 已发布旧版本：剔除周期字段，查询结果与升级前完全一致
             doc = _strip_cycle_fields(doc)
         return 200, doc
+
+
+# ------------------------------------------------- 按已发布版本恢复未封存周期
+
+def restore_cycle_from_version(db_path: str, device_id: str, cycle_id: str, body):
+    """现场误改未封存周期后，凭已发布版本把该周期恢复为版本冻结内容。
+
+    - 请求体 {version_no, fingerprint}：version_no 为已发布版本号；fingerprint
+      为 GET 周期详情中获取的**当前**周期内容指纹，与封存/预演同一核对口径；
+    - 在同一个 BEGIN IMMEDIATE 写事务内核对"当前指纹 + 封存状态 + 版本内容 +
+      采集编号占用"，任一项不符即整次拒绝（异常即回滚），不留下部分写入；
+    - 通过后只改目标周期：锚点整表替换为该版本冻结的 (device, cycle) 锚点；
+      声段本地起止与备注恢复为冻结内容，并补齐版本里有、当前缺失的声段、
+      删除当前在该周期但版本中不属于该周期的声段；cycles.note / 其他周期 /
+      bundles 重传回执 / versions 与 version_* 冻结快照均保持原样；
+    - 历史版本不记录空周期：版本中既无该周期锚点也无该周期声段时（旧版
+      format_rev=1 未标周期的记录按 default 解释），明确拒绝，绝不按空周期
+      清除当前数据；
+    - 版本声段的采集编号现被其他设备或其他周期占用 -> 整次拒绝；
+    - 返回恢复前后指纹、锚点与声段数量，以及按恢复后锚点重算的定位结果。
+    """
+    payload = require_payload(body)
+    require_fields(payload, ["version_no", "fingerprint"])
+    version_no = payload["version_no"]
+    if isinstance(version_no, bool) or not isinstance(version_no, int) or version_no < 1:
+        raise ApiError(400, "validation_error",
+                       "version_no 必须是正整数（已发布版本号）",
+                       {"value": version_no})
+    fingerprint = validate_fingerprint(payload["fingerprint"])
+
+    with db.session(db_path) as conn:
+        with db.write_txn(conn):
+            _get_device(conn, device_id)
+            cycle = _get_cycle(conn, device_id, cycle_id)
+            # 已封存周期内容已冻结，不存在"误改恢复"，一律拒绝
+            _raise_if_sealed(cycle)
+
+            v = conn.execute(
+                "SELECT version_no, format_rev FROM versions WHERE version_no=?",
+                (version_no,)).fetchone()
+            if not v:
+                raise ApiError(404, "version_not_found",
+                               f"版本 {version_no} 不存在，无法据此恢复周期",
+                               {"version_no": version_no})
+
+            # 恢复前快照与指纹（同一事务内核对，防止读快照与写入撕裂）
+            before_anchors, before_segs = _cycle_contents(conn, device_id, cycle_id)
+            before_fp = cycle_fingerprint(
+                device_id, cycle_id, before_anchors, before_segs)
+            if fingerprint != before_fp:
+                raise ApiError(
+                    409, "restore_fingerprint_stale",
+                    f"请求指纹与设备 {device_id} 周期 {cycle_id} 的当前内容不一致"
+                    f"（内容已变化，指纹过期），请重新获取周期详情后再恢复；"
+                    f"本次未改动任何数据",
+                    {"device_id": device_id, "cycle_id": cycle_id,
+                     "version_no": version_no,
+                     "current_fingerprint": before_fp})
+
+            # 版本冻结的目标周期锚点（旧版快照 cycle_id 为 NULL，按 default 解释）
+            frozen_anchor_rows = [
+                r for r in conn.execute(
+                    "SELECT device_id, cycle_id, local_ms, utc_ms "
+                    "FROM version_anchors WHERE version_no=? AND device_id=?",
+                    (version_no, device_id)).fetchall()
+                if (r["cycle_id"] or DEFAULT_CYCLE_ID) == cycle_id]
+            frozen_anchor_rows.sort(key=lambda r: r["local_ms"])
+            # 版本冻结的目标周期声段
+            frozen_rows = [
+                r for r in conn.execute(
+                    "SELECT * FROM version_segments WHERE version_no=? AND device_id=?",
+                    (version_no, device_id)).fetchall()
+                if (r["cycle_id"] or DEFAULT_CYCLE_ID) == cycle_id]
+            frozen_rows.sort(key=lambda r: r["capture_id"])
+
+            # 历史版本不记录空周期：两类冻结记录都没有时不能按空周期清除
+            if not frozen_anchor_rows and not frozen_rows:
+                raise ApiError(
+                    409, "restore_version_cycle_empty",
+                    f"版本 {version_no} 中既无设备 {device_id} 周期 {cycle_id} "
+                    f"的锚点也无声段（历史版本不记录空周期），拒绝恢复："
+                    f"不能凭空内容清除该周期当前锚点与声段；本次未改动任何数据",
+                    {"device_id": device_id, "cycle_id": cycle_id,
+                     "version_no": version_no,
+                     "format_rev": v["format_rev"]})
+
+            before_capture_ids = {s["capture_id"] for s in before_segs}
+            frozen_capture_ids = {r["capture_id"] for r in frozen_rows}
+
+            # 版本声段采集编号现被其他设备或周期占用 -> 整次拒绝
+            occupied = []
+            if frozen_capture_ids:
+                placeholders = ",".join("?" for _ in frozen_capture_ids)
+                for r in conn.execute(
+                        f"SELECT capture_id, device_id, cycle_id FROM segments "
+                        f"WHERE capture_id IN ({placeholders})",
+                        tuple(sorted(frozen_capture_ids))).fetchall():
+                    if (r["device_id"], r["cycle_id"]) != (device_id, cycle_id):
+                        occupied.append({"capture_id": r["capture_id"],
+                                         "device_id": r["device_id"],
+                                         "cycle_id": r["cycle_id"]})
+            if occupied:
+                occupied.sort(key=lambda x: x["capture_id"])
+                raise ApiError(
+                    409, "restore_capture_occupied",
+                    f"版本 {version_no} 中 {len(occupied)} 个声段采集编号现被其他"
+                    f"设备或周期占用，无法恢复到设备 {device_id} 周期 {cycle_id}，"
+                    f"整次拒绝，不改动任何数据",
+                    {"device_id": device_id, "cycle_id": cycle_id,
+                     "version_no": version_no, "occupied": occupied})
+
+            # ---- 全部校验通过：只重写目标周期的锚点与声段 ----
+            now = iso_now()
+            conn.execute("DELETE FROM anchors WHERE device_id=? AND cycle_id=?",
+                         (device_id, cycle_id))
+            conn.executemany(
+                "INSERT INTO anchors(device_id, cycle_id, local_ms, utc_ms, created_at) "
+                "VALUES (?,?,?,?,?)",
+                [(device_id, cycle_id, r["local_ms"], r["utc_ms"], now)
+                 for r in frozen_anchor_rows])
+
+            # 当前在目标周期、但不属于该版本目标周期的声段：删除
+            removed_ids = sorted(before_capture_ids - frozen_capture_ids)
+            if removed_ids:
+                ph = ",".join("?" for _ in removed_ids)
+                conn.execute(
+                    f"DELETE FROM segments WHERE capture_id IN ({ph}) "
+                    f"AND device_id=? AND cycle_id=?",
+                    (*removed_ids, device_id, cycle_id))
+
+            inserted_ids, updated_ids = [], []
+            for r in frozen_rows:
+                digest = segment_content_hash(
+                    r["capture_id"], device_id, cycle_id,
+                    r["local_start_ms"], r["local_end_ms"], r["note"])
+                if r["capture_id"] in before_capture_ids:
+                    # 恢复本地起止与备注；创建时间保持现有值（不改变采集事实）
+                    conn.execute(
+                        "UPDATE segments SET local_start_ms=?, local_end_ms=?, "
+                        "note=?, content_hash=? WHERE capture_id=? AND device_id=? "
+                        "AND cycle_id=?",
+                        (r["local_start_ms"], r["local_end_ms"], r["note"],
+                         digest, r["capture_id"], device_id, cycle_id))
+                    updated_ids.append(r["capture_id"])
+                else:
+                    # 版本中有、当前缺失的声段：补录，创建时间沿用冻结快照
+                    conn.execute(
+                        """INSERT INTO segments(capture_id, device_id, cycle_id,
+                                                local_start_ms, local_end_ms,
+                                                note, content_hash, created_at)
+                           VALUES (?,?,?,?,?,?,?,?)""",
+                        (r["capture_id"], device_id, cycle_id,
+                         r["local_start_ms"], r["local_end_ms"], r["note"],
+                         digest, r["created_at"] or now))
+                    inserted_ids.append(r["capture_id"])
+
+            # ---- 恢复后：按恢复后锚点重算当前时间轴上的定位结果 ----
+            after_anchors, after_segs = _cycle_contents(conn, device_id, cycle_id)
+            after_fp = cycle_fingerprint(
+                device_id, cycle_id, after_anchors, after_segs)
+            pair = ([a["local_ms"] for a in after_anchors],
+                    [a["utc_ms"] for a in after_anchors])
+            projections = sort_projections(
+                [project_segment(s, pair) for s in after_segs])
+            located_count = sum(1 for p in projections
+                                if p["status"] == STATUS_LOCATED)
+            unlocatable_count = len(projections) - located_count
+
+            before_anchor_map = {a["local_ms"]: a["utc_ms"]
+                                 for a in before_anchors}
+            restored_anchors = [{"local_ms": r["local_ms"], "utc_ms": r["utc_ms"],
+                                 "changed": before_anchor_map.get(r["local_ms"])
+                                            != r["utc_ms"]}
+                                for r in frozen_anchor_rows]
+            restored_segments = [
+                {"capture_id": r["capture_id"],
+                 "local_start_ms": r["local_start_ms"],
+                 "local_end_ms": r["local_end_ms"], "note": r["note"],
+                 "change": ("inserted" if r["capture_id"] in inserted_ids
+                            else "updated")}
+                for r in frozen_rows]
+            return 200, {
+                "device_id": device_id, "cycle_id": cycle_id,
+                "version_no": version_no, "format_rev": v["format_rev"],
+                "before": {"fingerprint": before_fp,
+                           "anchor_count": len(before_anchors),
+                           "segment_count": len(before_segs)},
+                "after": {"fingerprint": after_fp,
+                          "anchor_count": len(after_anchors),
+                          "segment_count": len(after_segs),
+                          "located_count": located_count,
+                          "unlocatable_count": unlocatable_count},
+                "anchors": restored_anchors,
+                "segments": restored_segments,
+                "segment_projections": projections,
+                "restored": {"anchor_count": len(restored_anchors),
+                             "segment_count": len(restored_segments),
+                             "inserted_capture_ids": sorted(inserted_ids),
+                             "updated_capture_ids": sorted(updated_ids),
+                             "removed_capture_ids": removed_ids},
+                "message": "周期已按已发布版本冻结内容恢复：锚点已替换、声段本地"
+                           "起止与备注已恢复并按现有锚点重算当前时间轴；其他周期、"
+                           "采集包回执与已发布版本保持原样"}

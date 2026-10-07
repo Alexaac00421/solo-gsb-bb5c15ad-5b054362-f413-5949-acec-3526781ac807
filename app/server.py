@@ -52,6 +52,7 @@ def h_root(ctx, body, query):
             "GET    /devices/{device_id}/cycles",
             "GET    /devices/{device_id}/cycles/{cycle_id}         # 周期详情（内容指纹+封存状态）",
             "POST   /devices/{device_id}/cycles/{cycle_id}/seal    # 封存周期（携带指纹，不可撤销）",
+            "POST   /devices/{device_id}/cycles/{cycle_id}/restore # 按已发布版本恢复误改的未封存周期 {version_no,fingerprint}",
             "POST   /devices/{device_id}/anchors                   # body 可带 cycle_id，省略=default",
             "GET    /devices/{device_id}/anchors                   # 可加 ?cycle_id= 过滤",
             "PUT    /devices/{device_id}/anchors            # 锚点更正（按周期整体替换）",
@@ -193,6 +194,11 @@ def h_get_version(ctx, body, query, version_no):
     return service.get_version(ctx.db_path, no)
 
 
+def h_restore_cycle(ctx, body, query, device_id, cycle_id):
+    return service.restore_cycle_from_version(
+        ctx.db_path, device_id, validate_id(cycle_id, "cycle_id"), body)
+
+
 ROUTES = [
     ("GET", r"^/$", h_root),
     ("GET", r"^/health$", h_health),
@@ -203,6 +209,8 @@ ROUTES = [
     ("GET", r"^/devices/(?P<device_id>[^/]+)/cycles$", h_list_cycles),
     ("GET", r"^/devices/(?P<device_id>[^/]+)/cycles/(?P<cycle_id>[^/]+)$", h_get_cycle),
     ("POST", r"^/devices/(?P<device_id>[^/]+)/cycles/(?P<cycle_id>[^/]+)/seal$", h_seal_cycle),
+    ("POST", r"^/devices/(?P<device_id>[^/]+)/cycles/(?P<cycle_id>[^/]+)/restore$",
+     h_restore_cycle),
     ("POST", r"^/devices/(?P<device_id>[^/]+)/cycles/(?P<cycle_id>[^/]+)/drift-audit$",
      h_drift_audit),
     ("POST", r"^/devices/(?P<device_id>[^/]+)/cycles/(?P<cycle_id>[^/]+)/coverage/rehearse$",

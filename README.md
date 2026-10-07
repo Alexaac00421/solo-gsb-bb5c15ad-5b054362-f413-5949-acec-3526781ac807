@@ -278,6 +278,39 @@ python3 -m app          # 自动建库建表（默认 ./data/timeline.db），�
 }
 ```
 
+### 按已发布版本恢复周期（restore）
+
+现场误改了**尚未封存**周期的锚点或声段（锚点被更正、声段被误删/误录/记错起止备注）时，可凭任一已发布版本把该周期恢复为版本冻结内容。`POST /devices/{id}/cycles/{cycle_id}/restore`：
+
+- **请求体**：`{"version_no", "fingerprint"}`——`version_no` 为已发布版本号（正整数）；`fingerprint` 为 `GET` 周期详情中的**当前**内容指纹（与封存、预演同一核对口径）。
+- **同事务核对**：服务在单个 `BEGIN IMMEDIATE` 写事务内核对①当前指纹与封存状态、②版本是否存在、③版本中该周期的冻结内容、④冻结声段采集编号当前占用；任一项不符即**整次回滚，不留任何部分写入**。
+- **只改目标周期**：
+  - **锚点**整体替换为该版本冻结的该 `(设备, 周期)` 锚点（误增的删除、误删的补回、偏移的还原）；
+  - **声段**：本地起止与备注恢复为冻结内容（保留现有创建时间）；版本中属于该周期而当前缺失的声段**补录**（创建时间沿用冻结快照）；当前在该周期、但版本中不属于该周期的声段**删除**；
+  - 恢复后按恢复后锚点、沿用现有线性漂移与毫秒取整规则**重算当前时间轴**定位。
+- **空周期安全**：历史版本**不记录空周期**——版本中既无目标周期锚点也无目标周期声段时返回 `409 restore_version_cycle_empty`，**绝不按空周期清除**当前数据；旧版（`format_rev=1`）未标周期的冻结记录一律按 `default` 周期解释（据旧版恢复非 default 周期同样按空周期拒绝）。
+- **整次拒绝（不改动数据）**：版本不存在（`404 version_not_found`）、设备/周期不存在（`404 device_not_found` / `cycle_not_found`）、指纹过期（`409 restore_fingerprint_stale`，响应附 `current_fingerprint`）、周期已封存（`409 cycle_sealed`）、冻结声段采集编号现被**其他设备或其他周期**占用（`409 restore_capture_occupied`，`details.occupied` 列出占用方）；`version_no` 非正整数或指纹非 64 位小写 hex → `400 validation_error`。
+- **边界与不变量**：只有锚点或只有声段的冻结内容同样可恢复（无锚点声段恢复后仍为 `unlocatable`）；恢复后周期指纹等于按该版本冻结内容计算的周期指纹；`cycles.note`、**其他周期**、**采集包重传回执**、**已发布版本及其快照**全部保持原样，恢复本身也**不产生新版本**；恢复后同内容声段重传仍幂等、异内容仍冲突。
+- **成功响应（200）**：返回恢复**前后**指纹与锚点/声段数量、恢复后定位统计（`located_count` / `unlocatable_count`）、恢复的锚点与声段清单、`segment_projections` 恢复后定位结果，以及 `restored: {inserted/updated/removed_capture_ids, anchor_count, segment_count}` 分类。
+
+```json
+{
+  "device_id": "D1", "cycle_id": "default", "version_no": 1, "format_rev": 2,
+  "before": {"fingerprint": "0bef…cb8a", "anchor_count": 2, "segment_count": 2},
+  "after":  {"fingerprint": "30be…4fc4", "anchor_count": 2, "segment_count": 2,
+             "located_count": 2, "unlocatable_count": 0},
+  "anchors":  [{"local_ms": 1000, "utc_ms": 1700000000000, "changed": true}],
+  "segments": [{"capture_id": "C1", "local_start_ms": 5000, "local_end_ms": 20000,
+                "note": "鸟鸣", "change": "updated"}],
+  "segment_projections": [ {"capture_id": "C1", "status": "located",
+                            "utc_start_ms": 1700000004033, "utc_end_ms": 1700000019158} ],
+  "restored": {"anchor_count": 2, "segment_count": 2,
+               "inserted_capture_ids": ["C2"],
+               "updated_capture_ids":  ["C1"],
+               "removed_capture_ids":  ["C9"]}
+}
+```
+
 ### 线性漂移映射
 
 每台设备、**每个时钟周期**的锚点按本地时间排序后，在相邻锚点 `(l0,u0)`、`(l1,u1)` 间线性映射：
@@ -332,6 +365,12 @@ utc(t) = u0 + (t - l0) * (u1 - u0) / (l1 - l0)     # 结果四舍五入到毫秒
 | 采集包：引用未登记设备/周期（且未随包登记） | `404 device_not_found` / `404 cycle_not_found` |
 | 采集包：合并后锚点最终序列非法 | `400 anchors_not_increasing` |
 | 采集包：向已封存周期写入新锚点/声段 | `409 cycle_sealed` |
+| 版本恢复：指纹与当前内容不一致（指纹过期） | `409 restore_fingerprint_stale` |
+| 版本恢复：周期已封存 | `409 cycle_sealed` |
+| 版本恢复：版本/设备/周期不存在 | `404 version_not_found` / `404 device_not_found` / `404 cycle_not_found` |
+| 版本恢复：版本中既无目标周期锚点也无声段（空周期，拒绝清除） | `409 restore_version_cycle_empty` |
+| 版本恢复：版本声段采集编号被其他设备/周期占用 | `409 restore_capture_occupied` |
+| 版本恢复：version_no 非正整数、指纹非 64 位小写 hex、缺字段 | `400 validation_error` |
 
 ### 幂等与冲突
 
@@ -367,6 +406,7 @@ utc(t) = u0 + (t - l0) * (u1 - u0) / (l1 - l0)     # 结果四舍五入到毫秒
 | GET | `/devices/{id}/cycles` | 周期列表（含各周期锚点/声段计数与封存状态） |
 | GET | `/devices/{id}/cycles/{cycle_id}` | **周期详情**：内容稳定指纹 + 封存状态 |
 | POST | `/devices/{id}/cycles/{cycle_id}/seal` | **封存周期** `{fingerprint}`（不可撤销） |
+| POST | `/devices/{id}/cycles/{cycle_id}/restore` | **按已发布版本恢复误改的未封存周期** `{version_no, fingerprint}`（单事务原子，只改目标周期） |
 | POST | `/devices/{id}/anchors` | 录入锚点 `{local_ms, utc_ms, cycle_id?}`（省略周期=default） |
 | GET | `/devices/{id}/anchors` | 锚点列表（可加 `?cycle_id=`；每条带 `cycle_id`） |
 | PUT | `/devices/{id}/anchors` | **锚点更正**：按周期整体替换 `{cycle_id?, anchors:[...]}`（原子生效） |
@@ -845,6 +885,47 @@ bash examples/demo.sh                 # curl 版
 python3 examples/client.py            # Python 客户端版
 ```
 
+### 按已发布版本恢复周期（现场误改后回滚到冻结内容）
+
+```bash
+# 前置：已发布版本中冻结过该周期的锚点与声段（此处假设 v1 为核对版）
+# 1. 现场误改：锚点被更正、CAP-2 被误删、CAP-9 被误录……
+curl -s -X PUT $BASE/devices/D1/anchors -H 'Content-Type: application/json' \
+  -d '{"anchors":[{"local_ms":1000,"utc_ms":1700000000250},{"local_ms":61000,"utc_ms":1700000060750}]}'
+curl -s -X DELETE $BASE/segments/CAP-2
+
+# 2. 取当前周期详情中的内容指纹（恢复必须核对当前内容，防止覆盖他人改动）
+FP=$(curl -s $BASE/devices/D1/cycles/default | python3 -c 'import sys,json;print(json.load(sys.stdin)["cycle"]["fingerprint"])')
+
+# 3. 凭 v1 恢复：锚点替换、CAP-2 补录、CAP-9 删除，按恢复后锚点重算定位
+curl -s -X POST $BASE/devices/D1/cycles/default/restore \
+  -H 'Content-Type: application/json' \
+  -d "{\"version_no\":1,\"fingerprint\":\"$FP\"}"
+# => 200 {"before":{"fingerprint":...,"anchor_count":2,"segment_count":2},
+#         "after":{"fingerprint":...,"anchor_count":2,"segment_count":2,
+#                  "located_count":2,"unlocatable_count":0},
+#         "anchors":[...], "segment_projections":[...],
+#         "restored":{"inserted_capture_ids":["CAP-2"],
+#                     "updated_capture_ids":["CAP-1"],
+#                     "removed_capture_ids":["CAP-9"], ...}}
+
+# 4. 明确拒绝（整次回滚，不改动任何数据）：
+#    指纹过期 -> 409 restore_fingerprint_stale（details.current_fingerprint 供重取）
+#    版本不存在 -> 404 version_not_found；设备/周期不存在 -> 404
+#    周期已封存 -> 409 cycle_sealed
+#    版本中无该周期锚点与声段 -> 409 restore_version_cycle_empty（不按空周期清除）
+#    版本声段采集编号被其他设备/周期占用 -> 409 restore_capture_occupied
+#    （details.occupied 列占用方）；version_no 非正整数/指纹非法 -> 400
+
+# 已发布版本、其他周期、采集包重传回执均保持原样；恢复不产生新版本
+```
+
+独立示例（自动建设备/发布/误改/恢复/各类拒绝）：
+
+```bash
+python3 examples/restore_example.py http://localhost:8000
+```
+
 ### 响应示例
 
 `POST /versions` 返回（v1.1 周期版，节选）：
@@ -905,8 +986,9 @@ python3 -m unittest discover -s tests -v
 - `tests/test_drift.py`（24 个）：漂移审计的相邻配对速率/漂移（有符号，含偏快/偏慢方向）计算、首尾锚点与本地/UTC 跨度、恰好等于阈值不算超差（精确分数比较，含浮点阈值边界）、低于阈值不标异常、混合段只标超差段与全段最大绝对漂移、周期独立（只用指定周期锚点）、封存周期可审计、**历史版本审计冻结**（后续锚点更正/新发布不改历史结果）、**旧版（format_rev=1）冻结锚点周期归属按 default**（新周期旧版本无冻结锚点仍报锚点不足）、锚点不足/阈值非法（含 NaN/Infinity）/设备/周期/版本不存在明确拒绝且数据不变、审计只读、int64 锚点、纯逻辑（乱序排序/精确边界/锚点不足）以及**审计与更正/发布并发**下每次响应都是一致快照。
 - `tests/test_rehearsal.py`（21 个）：锚点更正覆盖预演的两侧同快照计算（更正前一侧与当前覆盖审计逐字段一致）、整体平移/改善/两侧多段退化（不连通区间分别列出、相邻退化分片合并）、毫秒取整口径与实际更正后审计一致、拟锚点覆盖不足致声段不可定位、同设备重叠只算一台、不可定位声段不计、其他周期与设备保持当前值、指纹过期/格式非法、周期封存拒绝、锚点非严格递增（local 重复/utc 非递增/乱序提交）、时间/区间/门槛非法、空或畸形锚点、缺字段、设备/周期不存在的明确拒绝、成功与被拒绝预演均只读（当前时间轴与已发布版本不变）、以及**预演与实际更正/发布并发**下两侧片段均拼满查询区间且恶化统计自洽。
 - `tests/test_bundle.py`（23 个）：采集包导入的成功计数与时间轴反映、包内乱序与同包引用（含隐式 default 周期）、与库中记录混合的新增/复用计数、空包、相同包乱序重传返回首次结果且不重复写入、状态变化（封存）后重传仍返回首次结果、包编号复用异内容拒绝、**被拒绝不留痕迹且编号可重用**、设备/周期/声段与库中或包内冲突的整包拒绝、引用缺失、锚点最终序列合并校验（库中+包内）、封存周期新增拒绝而完全一致记录复用、字段校验、已发布版本不变而新版反映导入、以及**并发导入与发布**下无半包状态、同包并发重传只写一次。
+- `tests/test_restore.py`（26 个）：按版本恢复的锚点整体替换与声段补齐/更新/删除、恢复前后指纹与数量及 inserted/updated/removed 分类、恢复后投影与冻结投影一致、当前时间轴/列表/详情计数同步、补录沿用冻结 created_at 而更新保留现有 created_at、恢复后同内容重传幂等异内容冲突、只改目标周期（其他周期/设备不变）、已发布版本与采集包回执不变且恢复不产生新版本、占用拒绝无部分写入、指纹过期/版本或设备或周期不存在/周期已封存/版本中无该周期内容（空周期不清除，含旧版非 default）/采集编号被其他周期或设备占用的整次拒绝、仅锚点或仅声段冻结内容、非 default 周期恢复、字段非法/缺字段、以及**旧版 format_rev=1 未标周期记录按 default 恢复**。
 
-## 升级与数据迁移（v1.0 → v1.1 → v1.2 → v1.3 → v1.4 → v1.5 → v1.6 → v1.7 → v1.8）
+## 升级与数据迁移（v1.0 → … → v1.8 → v1.9）
 
 - 沿用原启动方式（`python3 -m app` / Docker / Compose），服务启动时自动识别并在线迁移旧库，无需手工操作；
 - 旧设备自动补登 `default` 周期；旧锚点与声段一律归入 `default`；旧声段内容指纹按含周期的新口径重算（默认周期同内容重传仍为幂等）；
@@ -919,6 +1001,7 @@ python3 -m unittest discover -s tests -v
 - v1.6 新增 `POST /devices/{id}/cycles/{cycle_id}/drift-audit` 现场时钟漂移审计端点（只读），**无表结构变更**，旧库直接可用；历史版本审计基于既有 `version_anchors` 冻结锚点，旧版本（含 `format_rev=1`，周期归属按 default 处理）同样可审计。
 - v1.7 新增 `POST /devices/{id}/cycles/{cycle_id}/coverage/rehearse` 锚点更正覆盖预演端点（只读），**无表结构变更、无数据迁移**，旧库直接可用；预演仅在读事务快照内做内存锚点替换，从不写入，当前时间轴与已发布版本均不受影响。
 - v1.8 新增 `POST /bundles` 采集包导入端点与 `bundles` 表（记录导入成功的包：内容指纹 + 首次结果 JSON）；`CREATE TABLE IF NOT EXISTS` 随启动自动补表，**无数据迁移**，旧库直接可用；既有单条录入、周期封存与版本发布的调用及结果不受影响。
+- v1.9 新增 `POST /devices/{id}/cycles/{cycle_id}/restore` 按已发布版本恢复未封存周期端点，**无表结构变更、无数据迁移**，旧库直接可用；恢复只重写目标周期的既有 `anchors` / `segments` 行，从既有 `versions` / `version_anchors` / `version_segments` 读取冻结内容（旧版 `format_rev=1` 的 NULL 周期按 `default` 解释），`bundles` 回执与已发布版本快照均不改动。
 
 ## 项目结构
 
@@ -939,11 +1022,13 @@ tests/test_clip_regression.py # 回归测试（报告窗口当前时间轴裁剪
 tests/test_drift.py    # 端到端测试（现场时钟漂移审计 + 历史冻结 + 旧版快照 + 并发一致性）
 tests/test_rehearsal.py # 端到端测试（锚点更正覆盖预演：两侧同快照对比、恶化区间、只读与拒绝契约）
 tests/test_bundle.py   # 端到端测试（采集包导入：整包原子、包级幂等、合并序列校验、并发一致性）
+tests/test_restore.py  # 端到端测试（按已发布版本恢复未封存周期：原子恢复、空周期/占用拒绝、旧版 default）
 examples/demo.sh       # curl 调用示例（含周期、封存、批量纠正、覆盖审计、回放裁剪、漂移审计、更正预演与采集包导入）
-examples/client.py     # Python 客户端示例（含更正预演等全部 v1.7 能力）
+examples/client.py     # Python 客户端示例（含更正预演、版本恢复等全部 v1.9 能力）
 examples/clip_example.py # 回放裁剪报告窗口最小复现示例
 examples/drift_example.py # 现场时钟漂移审计最小复现示例
 examples/rehearsal_example.py # 锚点更正覆盖预演最小复现示例
 examples/bundle_example.py # 采集包导入最小复现示例（整包上传 + 断网重试）
+examples/restore_example.py # 按已发布版本恢复未封存周期最小复现示例（恢复 + 各类拒绝）
 Dockerfile / docker-compose.yml
 ```

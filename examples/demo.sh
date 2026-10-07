@@ -461,3 +461,57 @@ curl -s -X POST "$BASE/bundles" -H 'Content-Type: application/json' -d '{
 echo; echo "== 发布版本：反映采集包入库结果（已发布版本保持原快照）=="
 curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
   -d '{"note":"采集包入库"}' | pp
+
+
+# ----------------------------------------------------------------------
+# 按已发布版本恢复未封存周期（restore）：现场误改后凭已发布版本恢复
+# 使用独立设备 RS1（RD1 已在预演段封存，D1/default 已封存）
+# ----------------------------------------------------------------------
+
+echo; echo "== 恢复演示：建设备、锚点、声段并发布冻结版本 =="
+curl -s -X POST "$BASE/devices" -H 'Content-Type: application/json' \
+  -d '{"device_id":"RS1","name":"恢复演示-甲"}' | pp
+curl -s -X POST "$BASE/devices/RS1/anchors" -H 'Content-Type: application/json' \
+  -d '{"local_ms":1000,"utc_ms":1700000000000}' | pp
+curl -s -X POST "$BASE/devices/RS1/anchors" -H 'Content-Type: application/json' \
+  -d '{"local_ms":61000,"utc_ms":1700000060500}' | pp
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"SCAP-1","device_id":"RS1","local_start_ms":5000,"local_end_ms":20000,"note":"晨间鸟鸣"}' | pp
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"SCAP-2","device_id":"RS1","local_start_ms":30000,"local_end_ms":40000}' | pp
+RV=$(curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' -d '{"note":"核对版"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["version_no"])')
+echo "冻结版本号 RV=$RV"
+
+echo; echo "== 现场误改：锚点 +250ms、误删 SCAP-2、误录 SCAP-9 =="
+curl -s -X PUT "$BASE/devices/RS1/anchors" -H 'Content-Type: application/json' \
+  -d '{"anchors":[{"local_ms":1000,"utc_ms":1700000000250},{"local_ms":61000,"utc_ms":1700000060750}]}' | pp
+curl -s -X DELETE "$BASE/segments/SCAP-2" | pp
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"SCAP-9","device_id":"RS1","local_start_ms":1000,"local_end_ms":2000}' | pp
+
+echo; echo "== 指纹过期 -> 409 restore_fingerprint_stale（不改动数据）=="
+curl -s -X POST "$BASE/devices/RS1/cycles/default/restore" -H 'Content-Type: application/json' \
+  -d "{\"version_no\":$RV,\"fingerprint\":\"0000000000000000000000000000000000000000000000000000000000000000\"}" | pp
+
+echo; echo "== 取当前指纹并凭版本恢复：返回前后指纹、数量与恢复后定位 =="
+RFP=$(curl -s "$BASE/devices/RS1/cycles/default" | python3 -c 'import sys,json;print(json.load(sys.stdin)["cycle"]["fingerprint"])')
+curl -s -X POST "$BASE/devices/RS1/cycles/default/restore" -H 'Content-Type: application/json' \
+  -d "{\"version_no\":$RV,\"fingerprint\":\"$RFP\"}" | pp
+
+echo; echo "== 版本中无目标周期内容 -> 409 restore_version_cycle_empty（不按空周期清除）=="
+curl -s -X POST "$BASE/devices/RS1/cycles" -H 'Content-Type: application/json' \
+  -d '{"cycle_id":"boot-x"}' | pp
+XFP=$(curl -s "$BASE/devices/RS1/cycles/boot-x" | python3 -c 'import sys,json;print(json.load(sys.stdin)["cycle"]["fingerprint"])')
+curl -s -X POST "$BASE/devices/RS1/cycles/boot-x/restore" -H 'Content-Type: application/json' \
+  -d "{\"version_no\":$RV,\"fingerprint\":\"$XFP\"}" | pp
+
+echo; echo "== 版本不存在 / version_no 非法 -> 404 / 400 =="
+AFP=$(curl -s "$BASE/devices/RS1/cycles/default" | python3 -c 'import sys,json;print(json.load(sys.stdin)["cycle"]["fingerprint"])')
+curl -s -X POST "$BASE/devices/RS1/cycles/default/restore" -H 'Content-Type: application/json' \
+  -d "{\"version_no\":9999,\"fingerprint\":\"$AFP\"}" | pp
+curl -s -X POST "$BASE/devices/RS1/cycles/default/restore" -H 'Content-Type: application/json' \
+  -d "{\"version_no\":0,\"fingerprint\":\"$AFP\"}" | pp
+
+echo; echo "== 已发布版本保持原样（恢复不产生新版本）=="
+curl -s "$BASE/versions/$RV" | pp

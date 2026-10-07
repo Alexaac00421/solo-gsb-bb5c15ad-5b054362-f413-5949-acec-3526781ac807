@@ -55,6 +55,24 @@ class TimelineClient:
         return self._call("POST", f"/devices/{device_id}/cycles/{cycle_id}/seal",
                           {"fingerprint": fingerprint})
 
+    def restore_cycle(self, device_id: str, version_no: int,
+                      fingerprint: str | None = None, cycle_id: str = "default"):
+        """按已发布版本恢复误改的未封存周期。
+
+        携带 version_no 与当前周期详情中的内容指纹（fingerprint 省略时自动
+        获取）；服务在同一写事务内核对指纹/封存状态/版本内容/采集编号占用，
+        通过后把该周期锚点、声段本地起止与备注恢复为该版本冻结内容并按
+        恢复后锚点重算定位。指纹过期 -> 409 restore_fingerprint_stale，
+        周期已封存 -> 409 cycle_sealed，版本中无该周期内容 -> 409
+        restore_version_cycle_empty，冻结采集编号被其他设备/周期占用 ->
+        409 restore_capture_occupied；任一拒绝都不留部分写入。
+        """
+        fp = fingerprint or self.cycle_detail(device_id, cycle_id)[1][
+            "cycle"]["fingerprint"]
+        return self._call(
+            "POST", f"/devices/{device_id}/cycles/{cycle_id}/restore",
+            {"version_no": version_no, "fingerprint": fp})
+
     # 锚点
     def add_anchor(self, device_id: str, local_ms: int, utc_ms: int,
                    cycle_id: str | None = None):
